@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "usersmanager"
+version = "0.1.0"
+authors = [
+  { name="Tobias Diaz", email="tobias.diaz@uclm.es" },
+  { name="Jose Luis Segura", email="joseluis.segura@uclm.es"},
+]
+description = "Template for Distributed Systems laboratory"
+requires-python = ">=3.10"
+dependencies = ['zeroc-ice']
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Operating System :: OS Independent",
+]
+license = "GPL-3.0-only"
+
+[project.scripts]
+users-manager = "usersmanager.command_handlers:users_manager_server"
+
+[project.optional-dependencies]
+linters = ["mypy", "pylint", "ruff"]
+
+# Tools configuration
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
+# Enable pydocstyle too
+# Unlike Flake8, Ruff doesn't enable pycodestyle warnings (`W`) or
+# McCabe complexity (`C901`) by default.
+select = ["E", "W", "F", "D"]
+ignore = ["D203", "D213"]
+
+[tool.pylint.TYPECHECK]
+ignored-classes = ["Ice"]
+
+[[tool.mypy.overrides]]
+module = [
+  "Ice",
+  "UsersManager"
+]
+ignore_missing_imports = true
