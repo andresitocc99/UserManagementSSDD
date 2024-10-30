@@ -3,20 +3,25 @@
 from typing import Optional
 
 import Ice
+import IceStorm
 import UsersManager as um
 from usersmanager.session import Session
-from usersmanager.delayed_response import ManagerQuery
+from usersmanager.delayed_response import ManagerQuery, ManagerQueryResponse
+import json
+import os
+import traceback
+import threading
 
 
 class Manager(um.Manager):
     """Skeleton for the Manager implementation."""
 
-    def __init__(self,communicator):
+    def __init__(self,communicator,topic_manager):
         self.users = {}
         self.sessions = {}
         self.communicator = communicator
+        self.topic_manager = topic_manager
 
-        self.topic_manager = None
         self.topic = None
         self.setup_ice_storm()
         self.filename = "users.json"
@@ -27,30 +32,39 @@ class Manager(um.Manager):
             json.dump(self.users, file)
 
     def load_users_from_file(self, filename):
-        with open(filename, 'r') as file:
-            self.users = json.load(file)
+        try:
+            with open(filename, 'r') as file:
+                self.users = json.load(file)
+        except json.JSONDecodeError:
+            # Si el archivo está vacío o no tiene un JSON válido, inicializa self.users como un diccionario vacío
+            self.users = {}
+            print(f"{filename} estaba vacío o corrupto. Inicializando como un diccionario vacío.")
+        
 
     def setup_ice_storm(self):
         """Setup IceStorm TopicManager and event topic."""
         try:
-            # Conectar con el TopicManager de IceStorm
-            topic_manager_proxy = self.communicator.stringToProxy("IceStorm/TopicManager:tcp -p 10000")
-            self.topic_manager = IceStorm.TopicManagerPrx.checkedCast(topic_manager_proxy)
-
-            if not self.topic_manager:
-                raise RuntimeError("No se pudo conectar al TopicManager de IceStorm.")
-            print("Conectado al TopicManager de IceStorm.")
-
             # Obtener o crear el canal de eventos "UserEvents"
             try:
                 self.topic = self.topic_manager.retrieve("UserEvents")
             except IceStorm.NoSuchTopic:
                 self.topic = self.topic_manager.create("UserEvents")
-            print("Publicador de IceStorm configurado.")
+
+            # Configurar como publicador
+            self.publisher = um.ManagerQueryPrx.uncheckedCast(self.topic.getPublisher())
+
+            # Configurar como suscriptor
+            subscriber_adapter = self.communicator.createObjectAdapter("SubscriberAdapter")
+            subscriber = ManagerQuery(self.users, self.sessions)  # Implementación de la interfaz ManagerQuery
+            subscriber_proxy = subscriber_adapter.addWithUUID(subscriber)
+            subscriber_adapter.activate()
+            
+            self.topic.subscribeAndGetPublisher({}, subscriber_proxy)
+            print("Suscrito al topic 'UserEvents' para recibir mensajes.")
 
         except Exception as e:
             print(f"Error al configurar IceStorm: {e}")
-            # Podrías agregar aquí algún mecanismo de reintento o simplemente manejar el error
+            traceback.print_exc()
 
     def login(self, username: str, password: str, current: Optional[Ice.Current] = None) -> um.SessionPrx:
         """Create and return a Session object proxy if the credentials are valid."""
@@ -72,10 +86,12 @@ class Manager(um.Manager):
             # Publicar un evento para consultar a otras instancias
             try:
                 response_event = threading.Event()  # Para esperar la respuesta
-                callback_adapter = self.communicator.createObjectAdapter("")  # Adaptador sin nombre específico
+                callback_adapter = self.communicator.createObjectAdapter("callbackAdapter")  # Adaptador sin nombre específico
                 callback = ManagerQueryResponse(response_event)  # Callback con el evento
                 proxy_callback = callback_adapter.addWithUUID(callback)
                 callback_adapter.activate()
+
+                topic = self.get_or_setup_topic()
 
                 publisher = self.topic.getPublisher()
                 query_publisher = um.ManagerQueryPrx.uncheckedCast(publisher)
@@ -103,20 +119,16 @@ class Manager(um.Manager):
 
         try:
             response_event = threading.Event()
-            callback_adapter = self.communicator.createObjectAdapter("")  # Crear un adaptador para el callback sin nombre específico
-            callback = ManagerQueryResponse(response_event)  # Crear el objeto callback con el evento asociado
-            proxy_callback = callback_adapter.addWithUUID(callback)  # Añadir el callback al adaptador y obtener su proxy
-            callback_adapter.activate()  # Activar el adaptador
+            callback_adapter = self.communicator.createObjectAdapter("")  # Adaptador callback
+            callback = ManagerQueryResponse(response_event)
+            proxy_callback = callback_adapter.addWithUUID(callback)
+            callback_adapter.activate()
 
             # Publicar un evento de verificación de usuario en el canal de IceStorm
-            publisher = self.topic.getPublisher()
-            query_publisher = um.ManagerQueryPrx.uncheckedCast(publisher)
-            query_publisher.checkUsername(username, um.ManagerQueryResponsePrx.uncheckedCast(proxy_callback))
+            self.publisher.checkUsername(username, um.ManagerQueryResponsePrx.uncheckedCast(proxy_callback))
             print(f"Evento de verificación del nombre de usuario '{username}' publicado.")
 
-            # Esperar la respuesta hasta 5 segundos antes de proceder con la creación
             if not response_event.wait(timeout=5):
-                # Si no se recibió respuesta en 5 segundos, se asume que el usuario no existe en otras instancias
                 print(f"No se recibió respuesta en 5 segundos, procediendo a crear el usuario '{username}'.")
 
                 # Registrar el nuevo usuario
@@ -127,47 +139,46 @@ class Manager(um.Manager):
                 session_id = session.getSessionID()
                 self.sessions[session_id] = session
 
-                # Usar el adaptador para agregar la sesión y crear el proxy
-                adapter = current.adapter
-                proxy = adapter.addWithUUID(session)
+                proxy = current.adapter.addWithUUID(session)
                 self.save_users_to_file(self.filename)
-
-                # Convertir el proxy a um.SessionPrx y devolverlo
                 return um.SessionPrx.checkedCast(proxy)
-
             else:
-                # Si el callback se activó, significa que el usuario ya existe en otra instancia
                 raise um.Unauthorized(f"El usuario '{username}' ya existe en otra instancia.")
 
         except Exception as e:
             print(f"Error al publicar el evento de verificación del nombre de usuario: {e}")
-            raise um.Unauthorized("Error al verificar si el usuario ya existe.")
+            traceback.print_exc()
+            raise um.Unauthorized(f"Error al verificar si el usuario ya existe: {e}")
 
     def removeUser(self, active_session: um.SessionPrx, current: Optional[Ice.Current] = None) -> None:
-        """Delete an user from the database, if the session is valid."""
-        
-        # Verificar si la sesión está activa
+        """Delete a user from the database, if the session is valid."""
+
+        # Verificar si la sesión está activa llamando al método remoto a través del proxy
         if not active_session.isAlive():
             raise um.SessionExpired("La sesión ha expirado.")
-        
-        # Obtener el nombre de usuario de la sesión activa
-        username = active_session.getUser()
-        
+
+        # Obtener el nombre de usuario de la sesión activa llamando a través del proxy
+        username = active_session.getUser()  # Llamada a través del proxy para obtener el nombre del usuario
+
         # Si el usuario existe localmente, eliminarlo directamente
         if username in self.users:
             # Eliminar al usuario de la base de datos local
             del self.users[username]
-            
-            # Eliminar la sesión de las sesiones activas
-            session_id = active_session.getSessionID()
-            if session_id in self.sessions:
-                del self.sessions[session_id]
-                self.save_users_to_file(self.filename)
 
+            # Eliminar la sesión de las sesiones activas usando el nombre del usuario
+            session_to_remove = None
+            for session_id, session in self.sessions.items():
+                if session.getUser() == username:
+                    session_to_remove = session_id
+                    break
+
+            if session_to_remove:
+                del self.sessions[session_to_remove]
+                self.save_users_to_file(self.filename)
 
             print(f"Usuario '{username}' eliminado exitosamente de la instancia local.")
             return
-           
+
         try:
             response_event = threading.Event()
             callback_adapter = self.communicator.createObjectAdapter("")
