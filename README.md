@@ -29,18 +29,11 @@ To run the implementation, run:
 2. ```usersmanager```:
 
 ```bash
-users-manager --Ice.Config=config/users-manager.config
+users-manager --Ice.Config=config/usersmanager.config
 ```
 
 3. Run the client which we will work with:
 
 ```bash
 . ./run_client
-```
-
-
-To run the template server, just install the package and run
-
-```bash
-users-manager --Ice.Config=config/users-manager.config
 ```
